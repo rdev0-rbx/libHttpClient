@@ -16,6 +16,9 @@ using namespace Windows::UI::Core;
 using namespace Windows::Foundation;
 using namespace DirectX;
 
+void HttpPerfTest();
+bool HttpPerfTestAfterActivation = false;
+
 ref class ViewProvider sealed : public IFrameworkView
 {
 public:
@@ -72,6 +75,8 @@ public:
 
     virtual void Run()
     {
+		if (HttpPerfTestAfterActivation) HttpPerfTest();
+
         while (!m_exit)
         {
             m_sample->Tick();
@@ -128,6 +133,7 @@ public:
 [Platform::MTAThread]
 int main(Platform::Array<Platform::String^>^ argv)
 {
+	if (!HttpPerfTestAfterActivation) HttpPerfTest();
     UNREFERENCED_PARAMETER(argv);
 
     // Default main thread to CPU 0

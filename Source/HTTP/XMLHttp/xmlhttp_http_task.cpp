@@ -294,3 +294,223 @@ XAsyncBlock* xmlhttp_http_task::async_block()
 {
     return m_asyncBlock;
 }
+
+#include "urls.h"
+
+class win32_handle
+{
+public:
+	win32_handle() : m_handle(nullptr)
+	{
+	}
+
+	~win32_handle()
+	{
+		if (m_handle != nullptr) CloseHandle(m_handle);
+		m_handle = nullptr;
+	}
+
+	void set(HANDLE handle)
+	{
+		m_handle = handle;
+	}
+
+	HANDLE get() { return m_handle; }
+
+private:
+	HANDLE m_handle;
+};
+
+static std::atomic<int> queuedRequests;
+static win32_handle g_stopRequestedHandle;
+static win32_handle g_workReadyHandle;
+static win32_handle g_completionReadyHandle;
+
+static XTaskQueueHandle m_queue;
+static XTaskQueueRegistrationToken m_callbackToken;
+
+
+static std::atomic<int> processedRequests, processedSize;
+
+int firstCallTime;
+
+void MakeHttpCallSingleX(const char* url)
+{
+	static bool first = true;
+	if (first)
+	{
+		first = false;
+		firstCallTime = GetTickCount();
+	}
+	queuedRequests++;
+
+	std::string requestBody = "";
+	std::string requestMethod = "GET";
+	std::string requestUrl = url;
+	bool retryAllowed = true;
+
+	HCCallHandle call = nullptr;
+	HCHttpCallCreate(&call);
+	HCHttpCallRequestSetUrl(call, requestMethod.c_str(), requestUrl.c_str());
+
+	HCHttpCallRequestSetRetryAllowed(call, retryAllowed);
+	HCHttpCallRequestSetHeader(call, "User-Agent", "XboxServicesAPI", true);
+	HCHttpCallRequestSetHeader(call, "x-xbl-contract-version", "1", true);
+
+	XAsyncBlock* asyncBlock = new XAsyncBlock;
+	ZeroMemory(asyncBlock, sizeof(XAsyncBlock));
+	asyncBlock->context = call;
+	asyncBlock->queue = m_queue;
+	asyncBlock->callback = [](XAsyncBlock* asyncBlock)
+	{
+		HCCallHandle call = static_cast<HCCallHandle>(asyncBlock->context);
+
+		size_t bsize = 0;
+		HCHttpCallResponseGetResponseBodyBytesSize(call, &bsize);
+		HCHttpCallCloseHandle(call);
+
+		std::wstringstream ss;
+
+		size_t newSize = (processedSize += (int)bsize);
+		int reqId = processedRequests++;
+
+		int curT = GetTickCount();
+		ss << L"Response " << reqId << " size: " << bsize << " total size: " << newSize << " qsize: " << queuedRequests << "t: " << (curT - firstCallTime) << "\n";
+		OutputDebugString(ss.str().c_str());
+
+		delete asyncBlock;
+
+		queuedRequests--;
+
+		if (sizeof(urls) / sizeof(urls[0]) == reqId + 1)
+		{
+            ss.clear();
+			ss << L"Total time " << (curT - firstCallTime) << " count: " << (reqId + 1) << " total size: " << newSize << "\n";
+			OutputDebugString(ss.str().c_str());
+		}
+	};
+
+	HCHttpCallPerformAsync(call, asyncBlock);
+}
+
+
+static std::deque<const char*> uqueue(urls, urls + sizeof(urls) / sizeof(urls[0]));
+
+void MakeHttpCallTick()
+{
+	while (queuedRequests < 16 && !uqueue.empty())
+	{
+		auto url = uqueue.front();
+		uqueue.pop_front();
+		MakeHttpCallSingleX(url);
+	}
+}
+
+
+
+static void CALLBACK HandleAsyncQueueCallback(
+	_In_ void* context,
+	_In_ XTaskQueueHandle queue,
+	_In_ XTaskQueuePort type
+)
+{
+	UNREFERENCED_PARAMETER(context);
+	UNREFERENCED_PARAMETER(queue);
+
+	switch (type)
+	{
+	case XTaskQueuePort::Work:
+		SetEvent(g_workReadyHandle.get());
+		break;
+
+	case XTaskQueuePort::Completion:
+		SetEvent(g_completionReadyHandle.get());
+		break;
+	}
+}
+
+static DWORD WINAPI background_thread_proc(LPVOID lpParam)
+{
+	HANDLE hEvents[3] =
+	{
+		g_workReadyHandle.get(),
+		g_completionReadyHandle.get(),
+		g_stopRequestedHandle.get()
+	};
+
+	XTaskQueueHandle queue = static_cast<XTaskQueueHandle>(lpParam);
+
+	UNREFERENCED_PARAMETER(lpParam);
+	bool stop = false;
+	while (!stop)
+	{
+		DWORD dwResult = WaitForMultipleObjectsEx(3, hEvents, false, INFINITE, false);
+
+		switch (dwResult)
+		{
+		case WAIT_OBJECT_0: // work ready
+			if (XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0))
+			{
+				// If there's more pending work, then set the event to process them
+				SetEvent(g_workReadyHandle.get());
+			}
+			break;
+
+		case WAIT_OBJECT_0 + 1: // completed 
+			// Typically completions should be dispatched on the game thread, but
+			// for this simple XAML app we're doing it here
+			if (XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0))
+			{
+				// If there's more pending completions, then set the event to process them
+				SetEvent(g_completionReadyHandle.get());
+			}
+			break;
+
+		default:
+			stop = true;
+			break;
+		}
+	}
+
+	return 0;
+}
+
+HANDLE m_hBackgroundThread;
+
+void StartBackgroundThread()
+{
+	if (m_hBackgroundThread == nullptr)
+	{
+		m_hBackgroundThread = CreateThread(nullptr, 0, background_thread_proc, m_queue, 0, nullptr);
+	}
+}
+
+void HttpPerfTest()
+{
+	g_stopRequestedHandle.set(CreateEvent(nullptr, true, false, nullptr));
+	g_workReadyHandle.set(CreateEvent(nullptr, false, false, nullptr));
+	g_completionReadyHandle.set(CreateEvent(nullptr, false, false, nullptr));
+
+	HCInitialize(nullptr);
+	HCSettingsSetTraceLevel(HCTraceLevel::Verbose);
+
+	XTaskQueueCreate(
+		XTaskQueueDispatchMode::Manual,
+		XTaskQueueDispatchMode::Manual,
+		&m_queue);
+	XTaskQueueRegisterMonitor(m_queue, nullptr, HandleAsyncQueueCallback, &m_callbackToken);
+
+	StartBackgroundThread();
+
+	Sleep(16);
+
+	std::thread([] {
+		while (!uqueue.empty())
+		{
+			MakeHttpCallTick();
+			Sleep(1);
+		}
+	}).detach();
+
+	Sleep(1000000);
+}
